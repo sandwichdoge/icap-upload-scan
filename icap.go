@@ -12,6 +12,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -147,7 +148,7 @@ func (s *icapServer) doReqmod(br *bufio.Reader, bw *bufio.Writer, ih map[string]
 	body := io.LimitReader(&chunkedReader{r: br}, s.maxBody)
 
 	// ── Multipart: buffer and scan each part ──
-	if strings.Contains(strings.ToLower(ct), "multipart/form-data") {
+	if isMultipart(ct) {
 		if _, params, err := mime.ParseMediaType(ct); err == nil {
 			if bnd := params["boundary"]; bnd != "" {
 				s.dbg("multipart boundary=%s", bnd)
@@ -193,6 +194,13 @@ func (s *icapServer) doReqmod(br *bufio.Reader, bw *bufio.Writer, ih map[string]
 	s.send204(bw)
 }
 
+// isMultipart returns true if the Content-Type is any multipart/* type
+// that carries a boundary and whose parts should be scanned individually.
+func isMultipart(ct string) bool {
+	lower := strings.ToLower(ct)
+	return strings.HasPrefix(lower, "multipart/")
+}
+
 // ── Multipart scanner ───────────────────────────────────────────
 //
 // Each file part is buffered (up to maxPart) and fed through the full
@@ -215,14 +223,31 @@ func (s *icapServer) scanMultipart(body io.Reader, boundary, clientIP string) (s
 		}
 		partNum++
 
-		if fn := p.FileName(); fn != "" {
-			// ── File part: buffer and scan through pipeline ──
-			data, err := io.ReadAll(io.LimitReader(p, s.maxPart))
+		// Determine the effective reader for this part: if the part
+		// declares Content-Transfer-Encoding: base64, wrap in a
+		// base64 decoder so downstream scanners see raw bytes.
+		var partReader io.Reader = p
+		cte := strings.ToLower(strings.TrimSpace(p.Header.Get("Content-Transfer-Encoding")))
+		if cte == "base64" {
+			s.dbg("part %d: decoding base64 content-transfer-encoding", partNum)
+			partReader = base64.NewDecoder(base64.StdEncoding, p)
+		}
+
+		// Determine filename. For multipart/form-data the filename
+		// comes from Content-Disposition "filename" param.
+		// For multipart/related (and others) the part may have no
+		// Content-Disposition at all; fall back to the part's
+		// Content-Type or a generated name.
+		fn := partFilename(p, partNum)
+
+		if fn != "" {
+			// ── File / named part: buffer and scan through pipeline ──
+			data, err := io.ReadAll(io.LimitReader(partReader, s.maxPart))
 			p.Close()
 			if err != nil {
 				return "", fmt.Errorf("read part %s: %w", fn, err)
 			}
-			s.dbg("part %d: file=%s size=%d bytes", partNum, fn, len(data))
+			s.dbg("part %d: file=%s size=%d bytes (cte=%s)", partNum, fn, len(data), cte)
 
 			threat, err := s.pipe.scan(data, fn, clientIP)
 			if err != nil {
@@ -234,7 +259,7 @@ func (s *icapServer) scanMultipart(body io.Reader, boundary, clientIP string) (s
 		} else {
 			// ── Text field: accumulate ──
 			fieldName := p.FormName()
-			n, _ := io.Copy(&textFields, io.LimitReader(p, 1<<20))
+			n, _ := io.Copy(&textFields, io.LimitReader(partReader, 1<<20))
 			textFields.WriteByte('\n')
 			p.Close()
 			s.dbg("part %d: text field=%s size=%d bytes", partNum, fieldName, n)
@@ -256,6 +281,78 @@ func (s *icapServer) scanMultipart(body io.Reader, boundary, clientIP string) (s
 	}
 
 	return "", nil
+}
+
+// partFilename extracts a usable filename for a multipart part.
+//
+// For multipart/form-data, FileName() returns the "filename" param from
+// Content-Disposition. For multipart/related and other types the part
+// may carry Content-Disposition: attachment with a filename, or have no
+// disposition at all. In the latter case we derive a name from
+// Content-ID or Content-Type so that every non-trivial part gets scanned
+// as a "file".
+func partFilename(p *multipart.Part, partNum int) string {
+	// 1. Standard filename from Content-Disposition (works for form-data
+	//    and attachment dispositions alike).
+	if fn := p.FileName(); fn != "" {
+		return fn
+	}
+
+	// 2. If the part has a Content-Disposition with FormName (i.e. it is
+	//    a plain form field with no filename) → treat as text field.
+	if p.FormName() != "" {
+		return ""
+	}
+
+	// 3. No Content-Disposition at all (common in multipart/related).
+	//    Use Content-ID if available, otherwise generate a name.
+	if cid := p.Header.Get("Content-Id"); cid != "" {
+		// Strip angle brackets: <foo@bar> → foo@bar
+		cid = strings.Trim(cid, "<> ")
+		if cid != "" {
+			return cid
+		}
+	}
+
+	// 4. Derive extension from the part's own Content-Type.
+	pct := p.Header.Get("Content-Type")
+	ext := ""
+	if pct != "" {
+		mt, _, _ := mime.ParseMediaType(pct)
+		switch {
+		case strings.HasPrefix(mt, "text/html"):
+			ext = ".html"
+		case strings.HasPrefix(mt, "text/xml"), strings.HasPrefix(mt, "application/xml"):
+			ext = ".xml"
+		case strings.HasPrefix(mt, "text/"):
+			ext = ".txt"
+		case strings.HasPrefix(mt, "image/jpeg"):
+			ext = ".jpg"
+		case strings.HasPrefix(mt, "image/png"):
+			ext = ".png"
+		case strings.HasPrefix(mt, "application/pdf"):
+			ext = ".pdf"
+		case strings.HasPrefix(mt, "application/octet-stream"):
+			ext = ".bin"
+		default:
+			ext = ".bin"
+		}
+	}
+
+	// If the part content-type is purely text/plain with no indicators
+	// of being a file, treat it as a text field (return "").
+	if pct != "" {
+		mt, _, _ := mime.ParseMediaType(pct)
+		if mt == "text/plain" {
+			return ""
+		}
+	}
+
+	// For anything else (non-text parts with no name), generate one.
+	if ext == "" {
+		ext = ".bin"
+	}
+	return fmt.Sprintf("part-%d%s", partNum, ext)
 }
 
 // ── ICAP chunked-body reader ────────────────────────────────────
