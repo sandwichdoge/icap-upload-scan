@@ -4,10 +4,10 @@
 // rules with four layers of analysis:
 //
 //   1. Raw bytes — catches binary YARA patterns in any file type
-//   2. Recursive ZIP/OOXML extraction — unzips any PK archive up to
-//      maxZIPDepth levels deep, scanning every entry. OOXML entries
-//      (.xml) get tag-stripping; media paths get raw scans; nested
-//      ZIPs and OOXML files (e.g. .docx inside .zip inside .zip)
+//   2. Recursive archive extraction — unzips/unrars any ZIP, OOXML,
+//      or RAR archive up to maxArchiveDepth levels deep, scanning
+//      every entry. OOXML entries (.xml) get tag-stripping; nested
+//      archives of any supported type (ZIP-in-RAR, RAR-in-ZIP, etc.)
 //      are recursed into automatically.
 //   3. Encoding detection — decodes base64, hex, and URL-encoded
 //      payloads and re-scans the decoded content
@@ -35,17 +35,22 @@ import (
 	"time"
 
 	yara "github.com/hillu/go-yara/v4"
+	rardecode "github.com/nwaples/rardecode/v2"
 )
 
-// maxZIPDepth caps recursive archive extraction to prevent zip bombs
-// and pathological nesting. Covers .zip → .zip → .docx → xml (depth 3)
-// with headroom for exotic cases.
-const maxZIPDepth = 5
+// maxArchiveDepth caps recursive archive extraction to prevent archive
+// bombs and pathological nesting. Covers .rar → .zip → .docx → xml
+// (depth 3) with headroom for exotic cases.
+const maxArchiveDepth = 5
 
 // maxTotalDecompressed is a cumulative byte budget across all recursion
 // levels for a single top-level scan. Prevents decompression bombs that
 // stay under the per-entry limit but explode in aggregate.
 const maxTotalDecompressed = 200 << 20 // 200 MB
+
+// maxEntrySize is the per-entry decompression limit for both ZIP and
+// RAR entries. Entries larger than this are skipped.
+const maxEntrySize = 50 << 20 // 50 MB
 
 // DLPScanner applies YARA DLP rules to content.
 type DLPScanner struct {
@@ -110,7 +115,7 @@ func (d *DLPScanner) ReloadRules() {
 }
 
 // ScanBytes is the Scanner interface entry point. Orchestrates raw scan,
-// recursive ZIP extraction, and encoding detection.
+// recursive archive extraction, and encoding detection.
 func (d *DLPScanner) ScanBytes(data []byte, filename, clientIP string) (string, error) {
 	return d.scanFile(data, filename, clientIP)
 }
@@ -212,7 +217,7 @@ func (d *DLPScanner) scanData(data []byte, label string) string {
 // ── Composite file scanner ──────────────────────────────────────
 
 func (d *DLPScanner) scanFile(data []byte, filename, clientIP string) (string, error) {
-	d.dbg("scanFile: %s (%d bytes) magic=%x", filename, len(data), head(data, 4))
+	d.dbg("scanFile: %s (%d bytes) magic=%x", filename, len(data), head(data, 8))
 
 	// 1. Raw bytes
 	if threat := d.scanData(data, "raw:"+filename); threat != "" {
@@ -220,27 +225,37 @@ func (d *DLPScanner) scanFile(data []byte, filename, clientIP string) (string, e
 		return threat, nil
 	}
 
-	// 2. Recursive ZIP/OOXML extraction — handles plain .zip, .docx,
-	//    .xlsx, .pptx, nested archives, and OOXML-inside-zip.
+	// 2. Recursive archive extraction — handles ZIP, OOXML, and RAR,
+	//    including cross-format nesting (RAR-in-ZIP, ZIP-in-RAR, etc.).
+	totalRead := int64(0)
+
 	if isZIP(data) {
 		d.dbg("scanFile: %s is ZIP/OOXML, extracting (depth 0)", filename)
-		totalRead := int64(0)
 		threat, err := d.scanZIPRecursive(data, filename, clientIP, 0, &totalRead)
 		if err != nil {
 			log.Printf("dlp: zip scan warning [%s]: %v", filename, err)
-			// Non-fatal — continue to encoding detection.
+		} else if threat != "" {
+			return threat, nil
+		}
+	}
+
+	if isRAR(data) {
+		d.dbg("scanFile: %s is RAR, extracting (depth 0)", filename)
+		threat, err := d.scanRARRecursive(data, filename, clientIP, 0, &totalRead)
+		if err != nil {
+			log.Printf("dlp: rar scan warning [%s]: %v", filename, err)
 		} else if threat != "" {
 			return threat, nil
 		}
 	}
 
 	// 3. Encoding detection — base64, hex, URL-encoded payloads.
-	//    Skip for ZIP/OOXML archives: compressed data virtually never
-	//    contains valid base64/hex sequences, and the three regex passes
-	//    are expensive on multi-megabyte binary blobs. The individual
-	//    entries inside the ZIP were already scanned in step 2 (including
-	//    their own raw YARA pass), so nothing is missed.
-	if !isZIP(data) {
+	//    Skip for archives: compressed data virtually never contains
+	//    valid base64/hex sequences, and the three regex passes are
+	//    expensive on multi-megabyte binary blobs. The individual
+	//    entries inside the archive were already scanned in step 2
+	//    (including their own raw YARA pass), so nothing is missed.
+	if !isArchive(data) {
 		if threat := d.scanDecoded(data, filename, clientIP); threat != "" {
 			return threat, nil
 		}
@@ -249,22 +264,65 @@ func (d *DLPScanner) scanFile(data []byte, filename, clientIP string) (string, e
 	return "", nil
 }
 
+// ── Archive magic-byte detection ────────────────────────────────
+
+// isZIP checks the PK\x03\x04 magic bytes. Matches both plain ZIP
+// archives and OOXML formats (.docx, .xlsx, .pptx).
+func isZIP(data []byte) bool {
+	return len(data) >= 4 &&
+		data[0] == 'P' && data[1] == 'K' && data[2] == 0x03 && data[3] == 0x04
+}
+
+// isRAR checks the RAR magic bytes. Supports both RAR4 ("Rar!\x1a\x07\x00")
+// and RAR5 ("Rar!\x1a\x07\x01\x00").
+func isRAR(data []byte) bool {
+	if len(data) < 7 {
+		return false
+	}
+	// Common prefix: "Rar!\x1a\x07"
+	if data[0] != 'R' || data[1] != 'a' || data[2] != 'r' ||
+		data[3] != '!' || data[4] != 0x1a || data[5] != 0x07 {
+		return false
+	}
+	// RAR4: \x00 at offset 6
+	if data[6] == 0x00 {
+		return true
+	}
+	// RAR5: \x01\x00 at offset 6-7
+	if len(data) >= 8 && data[6] == 0x01 && data[7] == 0x00 {
+		return true
+	}
+	return false
+}
+
+// isArchive returns true if the data starts with any supported archive
+// magic bytes (ZIP/OOXML or RAR).
+func isArchive(data []byte) bool {
+	return isZIP(data) || isRAR(data)
+}
+
+// isOOXML is kept as an alias for backward compatibility with
+// scanDecoded's base64 path.
+func isOOXML(data []byte) bool {
+	return isZIP(data)
+}
+
 // ── Recursive ZIP scanning ──────────────────────────────────────
 //
 // scanZIPRecursive opens a ZIP archive, iterates every entry, and
 // dispatches each one based on content type:
 //
-//   - .xml entries     → strip tags, decode entities, YARA scan text
-//   - OOXML media dirs → YARA scan raw bytes
-//   - nested ZIP/OOXML → recurse (depth + 1)
-//   - everything else  → YARA scan raw bytes
+//   - .xml entries      → strip tags, decode entities, YARA scan text
+//   - nested ZIP/OOXML  → recurse (depth + 1)
+//   - nested RAR        → recurse via scanRARRecursive (depth + 1)
+//   - everything else   → YARA scan raw bytes
 //
 // Short-circuits on the first threat. Depth and cumulative byte
-// budgets prevent zip bombs.
+// budgets prevent archive bombs.
 
 func (d *DLPScanner) scanZIPRecursive(data []byte, filename, clientIP string, depth int, totalRead *int64) (string, error) {
-	if depth >= maxZIPDepth {
-		d.dbg("scanZIP: max depth %d reached for %s, skipping", maxZIPDepth, filename)
+	if depth >= maxArchiveDepth {
+		d.dbg("scanZIP: max depth %d reached for %s, skipping", maxArchiveDepth, filename)
 		return "", nil
 	}
 
@@ -275,7 +333,7 @@ func (d *DLPScanner) scanZIPRecursive(data []byte, filename, clientIP string, de
 
 	for _, f := range zr.File {
 		// Per-entry size guard.
-		if f.UncompressedSize64 > 50<<20 {
+		if f.UncompressedSize64 > maxEntrySize {
 			d.dbg("scanZIP: skipping oversized entry %s (%d bytes)", f.Name, f.UncompressedSize64)
 			continue
 		}
@@ -295,7 +353,7 @@ func (d *DLPScanner) scanZIPRecursive(data []byte, filename, clientIP string, de
 		if err != nil {
 			continue
 		}
-		raw, err := io.ReadAll(io.LimitReader(rc, 50<<20))
+		raw, err := io.ReadAll(io.LimitReader(rc, maxEntrySize))
 		rc.Close()
 		if err != nil {
 			continue
@@ -322,34 +380,126 @@ func (d *DLPScanner) scanZIPRecursive(data []byte, filename, clientIP string, de
 			return threat, nil
 		}
 
-		// ── Recurse into nested ZIP/OOXML archives ──
-		if isZIP(raw) {
-			d.dbg("scanZIP: recursing into nested archive %s (depth %d→%d)", f.Name, depth, depth+1)
-			threat, err := d.scanZIPRecursive(raw, label, clientIP, depth+1, totalRead)
-			if err != nil {
-				d.dbg("scanZIP: nested scan warning [%s]: %v", label, err)
-				// Non-fatal — continue scanning remaining entries.
-			} else if threat != "" {
-				return threat, nil
-			}
+		// ── Recurse into nested archives ──
+		if threat, err := d.recurseArchive(raw, label, clientIP, depth, totalRead); err != nil {
+			d.dbg("scanZIP: nested scan warning [%s]: %v", label, err)
+		} else if threat != "" {
+			return threat, nil
 		}
 	}
 
 	return "", nil
 }
 
-// isZIP checks the PK\x03\x04 magic bytes. Matches both plain ZIP
-// archives and OOXML formats (.docx, .xlsx, .pptx).
-func isZIP(data []byte) bool {
-	return len(data) >= 4 &&
-		data[0] == 'P' && data[1] == 'K' && data[2] == 0x03 && data[3] == 0x04
+// ── Recursive RAR scanning ──────────────────────────────────────
+//
+// scanRARRecursive opens a RAR archive via rardecode, iterates every
+// entry, and dispatches each one identically to scanZIPRecursive:
+//
+//   - .xml entries      → strip tags, decode entities, YARA scan text
+//   - nested ZIP/OOXML  → recurse via scanZIPRecursive (depth + 1)
+//   - nested RAR        → recurse (depth + 1)
+//   - everything else   → YARA scan raw bytes
+//
+// Short-circuits on the first threat. Shares the same depth and
+// cumulative byte budgets as scanZIPRecursive.
+
+func (d *DLPScanner) scanRARRecursive(data []byte, filename, clientIP string, depth int, totalRead *int64) (string, error) {
+	if depth >= maxArchiveDepth {
+		d.dbg("scanRAR: max depth %d reached for %s, skipping", maxArchiveDepth, filename)
+		return "", nil
+	}
+
+	rr, err := rardecode.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return "", fmt.Errorf("rar open: %w", err)
+	}
+
+	for {
+		header, err := rr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			d.dbg("scanRAR: header read error in %s: %v", filename, err)
+			break
+		}
+
+		// Skip directories.
+		if header.IsDir {
+			continue
+		}
+
+		// Per-entry size guard.
+		if header.UnPackedSize > maxEntrySize {
+			d.dbg("scanRAR: skipping oversized entry %s (%d bytes)", header.Name, header.UnPackedSize)
+			continue
+		}
+
+		// Cumulative decompression budget.
+		if *totalRead > maxTotalDecompressed {
+			d.dbg("scanRAR: cumulative decompression budget exceeded at %s", header.Name)
+			return "", nil
+		}
+
+		raw, err := io.ReadAll(io.LimitReader(rr, maxEntrySize))
+		if err != nil {
+			d.dbg("scanRAR: read error for %s in %s: %v", header.Name, filename, err)
+			continue
+		}
+		*totalRead += int64(len(raw))
+
+		lower := strings.ToLower(header.Name)
+		label := fmt.Sprintf("d%d:%s/%s", depth, filename, header.Name)
+
+		// ── XML entries: strip tags, scan text ──
+		if strings.HasSuffix(lower, ".xml") || strings.HasSuffix(lower, ".rels") {
+			stripped := stripXMLTags(raw)
+			decoded := decodeXMLEntities(stripped)
+			if threat := d.scanData(decoded, "xml:"+label); threat != "" {
+				log.Printf("dlp: FOUND %s in XML entry %s from %s", threat, label, clientIP)
+				return threat, nil
+			}
+			continue
+		}
+
+		// ── Scan raw bytes of every non-XML entry ──
+		if threat := d.scanData(raw, label); threat != "" {
+			log.Printf("dlp: FOUND %s in %s from %s", threat, label, clientIP)
+			return threat, nil
+		}
+
+		// ── Recurse into nested archives ──
+		if threat, err := d.recurseArchive(raw, label, clientIP, depth, totalRead); err != nil {
+			d.dbg("scanRAR: nested scan warning [%s]: %v", label, err)
+		} else if threat != "" {
+			return threat, nil
+		}
+	}
+
+	return "", nil
 }
 
-// isOOXML is kept as an alias for backward compatibility with
-// scanDecoded's base64 path.
-func isOOXML(data []byte) bool {
-	return isZIP(data)
+// ── Shared archive recursion ────────────────────────────────────
+//
+// recurseArchive checks whether raw entry data is a supported archive
+// format and recurses into it. Called from both scanZIPRecursive and
+// scanRARRecursive to handle cross-format nesting (RAR inside ZIP,
+// ZIP inside RAR, etc.).
+
+func (d *DLPScanner) recurseArchive(raw []byte, label, clientIP string, depth int, totalRead *int64) (string, error) {
+	if isZIP(raw) {
+		d.dbg("recurseArchive: nested ZIP at %s (depth %d→%d)", label, depth, depth+1)
+		return d.scanZIPRecursive(raw, label, clientIP, depth+1, totalRead)
+	}
+	if isRAR(raw) {
+		d.dbg("recurseArchive: nested RAR at %s (depth %d→%d)", label, depth, depth+1)
+		return d.scanRARRecursive(raw, label, clientIP, depth+1, totalRead)
+	}
+	return "", nil
 }
+
+// ── OOXML helpers ───────────────────────────────────────────────
 
 var ooxmlMediaDirs = []string{
 	"word/media/", "ppt/media/", "xl/media/",
@@ -487,11 +637,10 @@ func (d *DLPScanner) scanDecoded(data []byte, label, clientIP string) string {
 			log.Printf("dlp: FOUND %s in base64-decoded content of %s from %s", threat, label, clientIP)
 			return threat
 		}
-		// If the decoded base64 is a ZIP/OOXML, recurse into it.
-		if isZIP(decoded) {
+		// If the decoded base64 is an archive, recurse into it.
+		if isArchive(decoded) {
 			totalRead := int64(0)
-			threat, err := d.scanZIPRecursive(decoded, "b64:"+label, clientIP, 0, &totalRead)
-			if err == nil && threat != "" {
+			if threat, err := d.recurseArchive(decoded, "b64:"+label, clientIP, -1, &totalRead); err == nil && threat != "" {
 				return threat
 			}
 		}
