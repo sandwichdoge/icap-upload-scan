@@ -19,6 +19,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -132,20 +133,24 @@ func (s *icapServer) doReqmod(br *bufio.Reader, bw *bufio.Writer, ih map[string]
 	ct := hdrVal(httpHdr, "content-type")
 	s.dbg("content-type: %s", ct)
 
-	// ── Preview handling (safety net) ──
-	// If Squid sends a Preview header (from a cached OPTIONS response),
-	// drain the preview body and send 100 Continue to get the full body.
+	// ── Preview handling ──
+	// RFC 3507 §4.6: after 100 Continue the ICAP client sends only the
+	// *remainder* of the body (bytes after the preview window), not the
+	// full body again. For small uploads that fit entirely in the preview
+	// the remainder is an empty chunk, so we must buffer the preview bytes
+	// and prepend them to whatever arrives after 100 Continue.
+	var previewBuf bytes.Buffer
 	if preview := ih["preview"]; preview != "" {
-		s.dbg("preview header present: %s — draining and sending 100 Continue", preview)
-		previewReader := &chunkedReader{r: br}
-		n, _ := io.Copy(io.Discard, previewReader)
-		s.dbg("drained %d preview bytes", n)
+		s.dbg("preview header present: %s — buffering and sending 100 Continue", preview)
+		n, _ := io.Copy(&previewBuf, &chunkedReader{r: br})
+		s.dbg("buffered %d preview bytes", n)
 
 		fmt.Fprint(bw, "ICAP/1.0 100 Continue\r\n\r\n")
 		bw.Flush()
 	}
 
-	body := io.LimitReader(&chunkedReader{r: br}, s.maxBody)
+	remainder := &chunkedReader{r: br}
+	body := io.LimitReader(io.MultiReader(&previewBuf, remainder), s.maxBody)
 
 	// ── Multipart: buffer and scan each part ──
 	if isMultipart(ct) {
@@ -459,6 +464,7 @@ func hdrVal(hdrs, name string) string {
 }
 
 func inferFilename(httpHdr, fallback string) string {
+	// 1. Content-Disposition header (standard multipart / attachment).
 	cd := hdrVal(httpHdr, "content-disposition")
 	if cd != "" {
 		if _, params, err := mime.ParseMediaType(cd); err == nil {
@@ -467,16 +473,84 @@ func inferFilename(httpHdr, fallback string) string {
 			}
 		}
 	}
+
+	// Extract the raw request URI from the first line of the HTTP header.
+	var rawURI string
 	if idx := strings.Index(httpHdr, " "); idx > 0 {
 		rest := httpHdr[idx+1:]
 		if sp := strings.Index(rest, " "); sp > 0 {
-			path := rest[:sp]
-			if last := strings.LastIndex(path, "/"); last >= 0 && last < len(path)-1 {
-				return path[last+1:]
+			rawURI = rest[:sp]
+		}
+	}
+
+	if rawURI != "" {
+		// 2. SharePoint REST API: filename lives in the @a2 query
+		//    parameter (DecodedUrl inside AddUsingPath).
+		//    Pattern: ...AddUsingPath(DecodedUrl=@a2,...)&@a2='filename.txt'
+		if fn := queryParam(rawURI, "@a2"); fn != "" {
+			// SharePoint wraps in single quotes: @a2='report.docx'
+			fn = strings.Trim(fn, "'\"")
+			if fn != "" {
+				return fn
+			}
+		}
+
+		// 3. Generic query-string filename parameters used by various
+		//    cloud storage providers and upload APIs.
+		for _, key := range []string{"filename", "file", "name"} {
+			if fn := queryParam(rawURI, key); fn != "" {
+				return fn
+			}
+		}
+
+		// 4. Last path segment (original heuristic), but skip if it
+		//    looks like an API function call (contains '(' or '=').
+		if last := strings.LastIndex(rawURI, "/"); last >= 0 && last < len(rawURI)-1 {
+			seg := rawURI[last+1:]
+			// Strip query string from segment.
+			if q := strings.IndexByte(seg, '?'); q > 0 {
+				seg = seg[:q]
+			}
+			if !strings.ContainsAny(seg, "(=") && seg != "" {
+				return seg
 			}
 		}
 	}
+
 	return fallback
+}
+
+// queryParam extracts a single URL query-parameter value by key.
+// Handles both ?key=value and &key=value forms, and URL-decodes
+// the result. Returns "" if not found.
+func queryParam(rawURI, key string) string {
+	q := strings.IndexByte(rawURI, '?')
+	if q < 0 {
+		return ""
+	}
+	query := rawURI[q+1:]
+	for query != "" {
+		var kv string
+		if i := strings.IndexByte(query, '&'); i >= 0 {
+			kv, query = query[:i], query[i+1:]
+		} else {
+			kv, query = query, ""
+		}
+		eq := strings.IndexByte(kv, '=')
+		if eq < 0 {
+			continue
+		}
+		k := kv[:eq]
+		if k != key {
+			continue
+		}
+		v := kv[eq+1:]
+		if decoded, err := url.QueryUnescape(v); err == nil {
+			return decoded
+		}
+		return v
+	}
+	return ""
 }
 
 func (s *icapServer) dbg(format string, args ...any) {
