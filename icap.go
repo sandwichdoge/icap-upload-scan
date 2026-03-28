@@ -38,52 +38,72 @@ type icapServer struct {
 	debug     bool
 }
 
+// idleTimeout is how long we wait for the next request on a kept-alive
+// connection before closing it. Squid typically sends a new request
+// within milliseconds on a reused connection; 60s is generous.
+const idleTimeout = 60 * time.Second
+
+// requestTimeout is the maximum wall-clock time for a single ICAP
+// request (reading + scanning + responding).
+const requestTimeout = 300 * time.Second
+
 func (s *icapServer) handleConn(conn net.Conn) {
 	defer conn.Close()
-	s.sem <- struct{}{}        // acquire slot
-	defer func() { <-s.sem }() // release slot
 
-	conn.SetDeadline(time.Now().Add(300 * time.Second))
 	br := bufio.NewReaderSize(conn, 8192)
 	bw := bufio.NewWriterSize(conn, 4096)
-	defer bw.Flush()
 
-	// ── ICAP request line ──
-	line, err := br.ReadString('\n')
-	if err != nil {
-		return
-	}
-	fields := strings.Fields(strings.TrimSpace(line))
-	if len(fields) < 3 || fields[2] != "ICAP/1.0" {
-		return
-	}
-
-	// ── ICAP headers ──
-	ih := make(map[string]string, 8)
 	for {
-		ln, err := br.ReadString('\n')
-		if err != nil || strings.TrimSpace(ln) == "" {
-			break
-		}
-		if i := strings.IndexByte(ln, ':'); i > 0 {
-			ih[strings.ToLower(strings.TrimSpace(ln[:i]))] = strings.TrimSpace(ln[i+1:])
-		}
-	}
+		// ── Wait for the next request (idle phase — no semaphore held) ──
+		conn.SetDeadline(time.Now().Add(idleTimeout))
 
-	switch fields[0] {
-	case "OPTIONS":
-		fmt.Fprintf(bw,
-			"ICAP/1.0 200 OK\r\n"+
-				"ISTag: \"uploadscan-1\"\r\n"+
-				"Methods: REQMOD\r\n"+
-				"Service: uploadscan/1.0\r\n"+
-				"Allow: 204\r\n"+
-				"Max-Connections: %d\r\n"+
-				"\r\n", s.maxConns)
-	case "REQMOD":
-		s.doReqmod(br, bw, ih)
-	default:
-		fmt.Fprint(bw, "ICAP/1.0 405 Method Not Allowed\r\nISTag: \"uploadscan\"\r\n\r\n")
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return // client closed, timeout, or network error
+		}
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 3 || fields[2] != "ICAP/1.0" {
+			return
+		}
+
+		// Switch to the per-request deadline now that we have a request.
+		conn.SetDeadline(time.Now().Add(requestTimeout))
+
+		// ── ICAP headers ──
+		ih := make(map[string]string, 8)
+		for {
+			ln, err := br.ReadString('\n')
+			if err != nil || strings.TrimSpace(ln) == "" {
+				break
+			}
+			if i := strings.IndexByte(ln, ':'); i > 0 {
+				ih[strings.ToLower(strings.TrimSpace(ln[:i]))] = strings.TrimSpace(ln[i+1:])
+			}
+		}
+
+		switch fields[0] {
+		case "OPTIONS":
+			fmt.Fprintf(bw,
+				"ICAP/1.0 200 OK\r\n"+
+					"ISTag: \"uploadscan-1\"\r\n"+
+					"Methods: REQMOD\r\n"+
+					"Service: uploadscan/1.0\r\n"+
+					"Allow: 204\r\n"+
+					"Connection: keep-alive\r\n"+
+					"Max-Connections: %d\r\n"+
+					"\r\n", s.maxConns)
+		case "REQMOD":
+			s.doReqmod(br, bw, ih)
+		default:
+			fmt.Fprint(bw, "ICAP/1.0 405 Method Not Allowed\r\nISTag: \"uploadscan\"\r\n\r\n")
+		}
+
+		bw.Flush()
+
+		// If the client signalled Connection: close, respect it.
+		if strings.EqualFold(ih["connection"], "close") {
+			return
+		}
 	}
 }
 
@@ -157,7 +177,10 @@ func (s *icapServer) doReqmod(br *bufio.Reader, bw *bufio.Writer, ih map[string]
 		if _, params, err := mime.ParseMediaType(ct); err == nil {
 			if bnd := params["boundary"]; bnd != "" {
 				s.dbg("multipart boundary=%s", bnd)
+				// Acquire scan slot — only held during scanning, not I/O.
+				s.sem <- struct{}{}
 				threat, err := s.scanMultipart(body, bnd, cip)
+				<-s.sem
 				if err != nil {
 					log.Printf("scan error: %v", err)
 					s.send500(bw)
@@ -176,12 +199,42 @@ func (s *icapServer) doReqmod(br *bufio.Reader, bw *bufio.Writer, ih map[string]
 	}
 
 	// ── Non-multipart: buffer entire body, scan once ──
-	data, err := io.ReadAll(body)
-	if err != nil {
-		s.dbg("non-multipart body read error from %s: %v", cip, err)
-		s.send204(bw)
-		return
+	// Change 4: pre-allocate from Content-Length when available to avoid
+	// io.ReadAll's repeated grow-and-copy.
+	clStr := hdrVal(httpHdr, "content-length")
+	cl, _ := strconv.ParseInt(clStr, 10, 64)
+	if cl > s.maxBody {
+		cl = s.maxBody
 	}
+
+	var data []byte
+	if cl > 0 {
+		// Known size: single allocation + ReadFull. The body reader is
+		// already limited to maxBody, so this is safe.
+		buf := make([]byte, cl)
+		n, err := io.ReadFull(body, buf)
+		if err == io.ErrUnexpectedEOF {
+			// Body was shorter than Content-Length — use what we got.
+			data = buf[:n]
+		} else if err != nil {
+			s.dbg("non-multipart body read error from %s: %v", cip, err)
+			s.send204(bw)
+			return
+		} else {
+			data = buf[:n]
+			// Drain any remaining bytes (chunked trailers, etc.)
+			io.Copy(io.Discard, body)
+		}
+	} else {
+		var err error
+		data, err = io.ReadAll(body)
+		if err != nil {
+			s.dbg("non-multipart body read error from %s: %v", cip, err)
+			s.send204(bw)
+			return
+		}
+	}
+
 	if len(data) == 0 {
 		s.dbg("non-multipart body empty from %s (ct=%s) → 204", cip, ct)
 		s.send204(bw)
@@ -192,7 +245,11 @@ func (s *icapServer) doReqmod(br *bufio.Reader, bw *bufio.Writer, ih map[string]
 	s.dbg("non-multipart body: %d bytes, filename=%s, ct=%s, magic=%x",
 		len(data), fname, ct, head(data, 4))
 
+	// Acquire scan slot — only held during CPU-intensive scanning,
+	// not during network I/O.
+	s.sem <- struct{}{}
 	threat, err := s.pipe.scan(data, fname, cip)
+	<-s.sem
 	if err != nil {
 		log.Printf("scan error: %v", err)
 		s.send500(bw)

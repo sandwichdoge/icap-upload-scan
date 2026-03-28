@@ -50,12 +50,14 @@ var (
 	fLog     = flag.String("log", "/var/log/uploadscan/uploadscan.log", "log file path")
 	fMaxMB   = flag.Int("max-body-mb", 30, "max total body size in MB")
 	fMaxPart = flag.Int("max-part-mb", 15, "max size per multipart part in MB")
-	fConns   = flag.Int("max-conns", 64, "max concurrent ICAP connections")
+	fConns   = flag.Int("max-conns", 64, "max concurrent scans (connections may exceed this)")
 	fDebug   = flag.Bool("debug", false, "enable verbose debug logging")
 
 	// Scanner toggles — allow disabling either engine without recompiling.
 	fNoClamAV = flag.Bool("no-clamav", false, "disable ClamAV scanning")
 	fNoDLP    = flag.Bool("no-dlp", false, "disable YARA DLP scanning")
+
+	fClamdPool = flag.Int("clamd-pool", 16, "max idle clamd connections in pool")
 )
 
 func main() {
@@ -88,7 +90,8 @@ func main() {
 	var dlpScanner *DLPScanner
 	if !*fNoClamAV {
 		pipe.register(&ClamAVScanner{
-			Socket: *fClamd,
+			Socket:   *fClamd,
+			PoolSize: *fClamdPool,
 		})
 	}
 	if !*fNoDLP {

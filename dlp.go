@@ -182,36 +182,82 @@ func (d *DLPScanner) scanFile(data []byte, filename, clientIP string) (string, e
 		return threat, nil
 	}
 
-	// 3. OOXML extraction
+	// 3. OOXML extraction — short-circuit: scan each entry as it's
+	//    decompressed rather than extracting the entire archive first.
 	if isOOXML(data) {
 		d.dbg("scanFile: %s is OOXML/ZIP, extracting", filename)
-		ec, err := extractOOXML(data)
+		threat, err := d.scanOOXML(data, filename, clientIP)
 		if err != nil {
-			log.Printf("dlp: ooxml extract warning [%s]: %v", filename, err)
+			log.Printf("dlp: ooxml scan warning [%s]: %v", filename, err)
 			return "", nil
 		}
-
-		if threat := d.scanData(ec.text, "text:"+filename); threat != "" {
-			log.Printf("dlp: FOUND %s in extracted text of %s from %s", threat, filename, clientIP)
+		if threat != "" {
 			return threat, nil
-		}
-		for i, media := range ec.media {
-			if threat := d.scanData(media, ec.labels[i]); threat != "" {
-				log.Printf("dlp: FOUND %s in %s embedded in %s from %s", threat, ec.labels[i], filename, clientIP)
-				return threat, nil
-			}
 		}
 	}
 
 	return "", nil
 }
 
-// ── OOXML extraction ────────────────────────────────────────────
+// ── OOXML scanning (short-circuit) ──────────────────────────────
+//
+// scanOOXML opens the ZIP, iterates entries, and scans each XML/media
+// entry as it is decompressed. Returns immediately on the first threat
+// without decompressing remaining entries.
 
-type extractedContent struct {
-	text   []byte
-	media  [][]byte
-	labels []string
+func (d *DLPScanner) scanOOXML(data []byte, filename, clientIP string) (string, error) {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return "", fmt.Errorf("zip open: %w", err)
+	}
+
+	for _, f := range zr.File {
+		if f.UncompressedSize64 > 50<<20 {
+			continue // zip bomb guard
+		}
+
+		lower := strings.ToLower(f.Name)
+
+		// ── XML entries: strip tags, decode entities, scan ──
+		if strings.HasSuffix(lower, ".xml") {
+			rc, err := f.Open()
+			if err != nil {
+				continue
+			}
+			raw, err := io.ReadAll(io.LimitReader(rc, 10<<20))
+			rc.Close()
+			if err != nil {
+				continue
+			}
+			stripped := stripXMLTags(raw)
+			decoded := decodeXMLEntities(stripped)
+
+			if threat := d.scanData(decoded, "xml:"+f.Name); threat != "" {
+				log.Printf("dlp: FOUND %s in XML entry %s of %s from %s", threat, f.Name, filename, clientIP)
+				return threat, nil
+			}
+		}
+
+		// ── Media/embedded entries: scan raw bytes ──
+		if isMediaPath(f.Name) {
+			rc, err := f.Open()
+			if err != nil {
+				continue
+			}
+			raw, err := io.ReadAll(io.LimitReader(rc, 20<<20))
+			rc.Close()
+			if err != nil {
+				continue
+			}
+
+			if threat := d.scanData(raw, f.Name); threat != "" {
+				log.Printf("dlp: FOUND %s in %s embedded in %s from %s", threat, f.Name, filename, clientIP)
+				return threat, nil
+			}
+		}
+	}
+
+	return "", nil
 }
 
 func isOOXML(data []byte) bool {
@@ -232,57 +278,6 @@ func isMediaPath(name string) bool {
 		}
 	}
 	return false
-}
-
-func extractOOXML(data []byte) (*extractedContent, error) {
-	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		return nil, fmt.Errorf("zip open: %w", err)
-	}
-
-	ec := &extractedContent{}
-	var textBuf bytes.Buffer
-
-	for _, f := range zr.File {
-		if f.UncompressedSize64 > 50<<20 {
-			continue // zip bomb guard
-		}
-
-		lower := strings.ToLower(f.Name)
-
-		if strings.HasSuffix(lower, ".xml") {
-			rc, err := f.Open()
-			if err != nil {
-				continue
-			}
-			raw, err := io.ReadAll(io.LimitReader(rc, 10<<20))
-			rc.Close()
-			if err != nil {
-				continue
-			}
-			stripped := stripXMLTags(raw)
-			decoded := decodeXMLEntities(stripped)
-			textBuf.Write(decoded)
-			textBuf.WriteByte('\n')
-		}
-
-		if isMediaPath(f.Name) {
-			rc, err := f.Open()
-			if err != nil {
-				continue
-			}
-			raw, err := io.ReadAll(io.LimitReader(rc, 20<<20))
-			rc.Close()
-			if err != nil {
-				continue
-			}
-			ec.media = append(ec.media, raw)
-			ec.labels = append(ec.labels, f.Name)
-		}
-	}
-
-	ec.text = textBuf.Bytes()
-	return ec, nil
 }
 
 func stripXMLTags(data []byte) []byte {
@@ -407,17 +402,9 @@ func (d *DLPScanner) scanDecoded(data []byte, label, clientIP string) string {
 			return threat
 		}
 		if isOOXML(decoded) {
-			if ec, err := extractOOXML(decoded); err == nil {
-				if threat := d.scanData(ec.text, "b64-text:"+label); threat != "" {
-					log.Printf("dlp: FOUND %s in base64-decoded OOXML text of %s from %s", threat, label, clientIP)
-					return threat
-				}
-				for i, media := range ec.media {
-					if threat := d.scanData(media, "b64-media:"+ec.labels[i]); threat != "" {
-						log.Printf("dlp: FOUND %s in base64-decoded OOXML media %s from %s", threat, ec.labels[i], clientIP)
-						return threat
-					}
-				}
+			threat, err := d.scanOOXML(decoded, "b64:"+label, clientIP)
+			if err == nil && threat != "" {
+				return threat
 			}
 		}
 	}
