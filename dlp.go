@@ -235,8 +235,15 @@ func (d *DLPScanner) scanFile(data []byte, filename, clientIP string) (string, e
 	}
 
 	// 3. Encoding detection — base64, hex, URL-encoded payloads.
-	if threat := d.scanDecoded(data, filename, clientIP); threat != "" {
-		return threat, nil
+	//    Skip for ZIP/OOXML archives: compressed data virtually never
+	//    contains valid base64/hex sequences, and the three regex passes
+	//    are expensive on multi-megabyte binary blobs. The individual
+	//    entries inside the ZIP were already scanned in step 2 (including
+	//    their own raw YARA pass), so nothing is missed.
+	if !isZIP(data) {
+		if threat := d.scanDecoded(data, filename, clientIP); threat != "" {
+			return threat, nil
+		}
 	}
 
 	return "", nil

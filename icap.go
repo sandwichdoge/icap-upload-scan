@@ -50,8 +50,10 @@ const requestTimeout = 300 * time.Second
 func (s *icapServer) handleConn(conn net.Conn) {
 	defer conn.Close()
 
-	br := bufio.NewReaderSize(conn, 8192)
-	bw := bufio.NewWriterSize(conn, 4096)
+	// Larger bufio buffers — reduces syscall overhead for
+	// multi-megabyte uploads streamed through chunked encoding.
+	br := bufio.NewReaderSize(conn, 64<<10) // 64 KB
+	bw := bufio.NewWriterSize(conn, 16<<10) // 16 KB
 
 	for {
 		// ── Wait for the next request (idle phase — no semaphore held) ──
@@ -150,7 +152,10 @@ func (s *icapServer) doReqmod(br *bufio.Reader, bw *bufio.Writer, ih map[string]
 		return
 	}
 
-	ct := hdrVal(httpHdr, "content-type")
+	// Parse HTTP headers once into a map, replacing repeated
+	// hdrVal scans over the same string.
+	hm := parseHTTPHeaders(httpHdr)
+	ct := hm["content-type"]
 	s.dbg("content-type: %s", ct)
 
 	// ── Preview handling ──
@@ -177,10 +182,9 @@ func (s *icapServer) doReqmod(br *bufio.Reader, bw *bufio.Writer, ih map[string]
 		if _, params, err := mime.ParseMediaType(ct); err == nil {
 			if bnd := params["boundary"]; bnd != "" {
 				s.dbg("multipart boundary=%s", bnd)
-				// Acquire scan slot — only held during scanning, not I/O.
-				s.sem <- struct{}{}
+				// Semaphore is now acquired inside scanMultipart
+				// around each individual scan call, not around all the I/O.
 				threat, err := s.scanMultipart(body, bnd, cip)
-				<-s.sem
 				if err != nil {
 					log.Printf("scan error: %v", err)
 					s.send500(bw)
@@ -199,9 +203,9 @@ func (s *icapServer) doReqmod(br *bufio.Reader, bw *bufio.Writer, ih map[string]
 	}
 
 	// ── Non-multipart: buffer entire body, scan once ──
-	// Change 4: pre-allocate from Content-Length when available to avoid
+	// Pre-allocate from Content-Length when available to avoid
 	// io.ReadAll's repeated grow-and-copy.
-	clStr := hdrVal(httpHdr, "content-length")
+	clStr := hm["content-length"]
 	cl, _ := strconv.ParseInt(clStr, 10, 64)
 	if cl > s.maxBody {
 		cl = s.maxBody
@@ -241,7 +245,7 @@ func (s *icapServer) doReqmod(br *bufio.Reader, bw *bufio.Writer, ih map[string]
 		return
 	}
 
-	fname := inferFilename(httpHdr, "upload")
+	fname := inferFilenameFromMap(hm, httpHdr, "upload")
 	s.dbg("non-multipart body: %d bytes, filename=%s, ct=%s, magic=%x",
 		len(data), fname, ct, head(data, 4))
 
@@ -275,6 +279,10 @@ func isMultipart(ct string) bool {
 // Each file part is buffered (up to maxPart) and fed through the full
 // pipeline. Text form fields are accumulated and scanned together at
 // the end — catches sensitive data in non-file form fields.
+//
+// The semaphore is acquired only around each s.pipe.scan call,
+// not around the entire function. This way network I/O (reading parts
+// from the multipart stream) does not hold a scan slot.
 
 func (s *icapServer) scanMultipart(body io.Reader, boundary, clientIP string) (string, error) {
 	mr := multipart.NewReader(body, boundary)
@@ -311,14 +319,40 @@ func (s *icapServer) scanMultipart(body io.Reader, boundary, clientIP string) (s
 
 		if fn != "" {
 			// ── File / named part: buffer and scan through pipeline ──
-			data, err := io.ReadAll(io.LimitReader(partReader, s.maxPart))
-			p.Close()
-			if err != nil {
-				return "", fmt.Errorf("read part %s: %w", fn, err)
+			// Pre-allocate from part Content-Length when available
+			// to avoid io.ReadAll's repeated grow-and-copy.
+			var data []byte
+			if clStr := p.Header.Get("Content-Length"); clStr != "" {
+				if cl, err := strconv.ParseInt(clStr, 10, 64); err == nil && cl > 0 && cl <= s.maxPart {
+					buf := make([]byte, cl)
+					n, readErr := io.ReadFull(partReader, buf)
+					if readErr == io.ErrUnexpectedEOF {
+						data = buf[:n]
+					} else if readErr != nil {
+						p.Close()
+						return "", fmt.Errorf("read part %s: %w", fn, readErr)
+					} else {
+						data = buf[:n]
+						// Drain any trailing bytes.
+						io.Copy(io.Discard, io.LimitReader(partReader, s.maxPart-cl))
+					}
+				}
 			}
+			if data == nil {
+				var readErr error
+				data, readErr = io.ReadAll(io.LimitReader(partReader, s.maxPart))
+				if readErr != nil {
+					p.Close()
+					return "", fmt.Errorf("read part %s: %w", fn, readErr)
+				}
+			}
+			p.Close()
 			s.dbg("part %d: file=%s size=%d bytes (cte=%s)", partNum, fn, len(data), cte)
 
+			// Acquire semaphore only around the scan.
+			s.sem <- struct{}{}
 			threat, err := s.pipe.scan(data, fn, clientIP)
+			<-s.sem
 			if err != nil {
 				return "", err
 			}
@@ -339,7 +373,9 @@ func (s *icapServer) scanMultipart(body io.Reader, boundary, clientIP string) (s
 
 	// Scan concatenated text fields through the pipeline
 	if textFields.Len() > 0 {
+		s.sem <- struct{}{}
 		threat, err := s.pipe.scan(textFields.Bytes(), "", clientIP)
+		<-s.sem
 		if err != nil {
 			return "", err
 		}
@@ -515,22 +551,31 @@ func parseEnc(s string) map[string]int {
 	return m
 }
 
-func hdrVal(hdrs, name string) string {
-	lo := strings.ToLower(name)
-	for _, line := range strings.Split(hdrs, "\r\n") {
+// parseHTTPHeaders splits raw HTTP headers into a lower-cased map in a
+// single pass. Replaces the old hdrVal approach which re-scanned the
+// entire header block for each lookup.
+func parseHTTPHeaders(raw string) map[string]string {
+	m := make(map[string]string, 8)
+	for _, line := range strings.Split(raw, "\r\n") {
 		if i := strings.IndexByte(line, ':'); i > 0 {
-			if strings.ToLower(strings.TrimSpace(line[:i])) == lo {
-				return strings.TrimSpace(line[i+1:])
+			key := strings.ToLower(strings.TrimSpace(line[:i]))
+			// First value wins (consistent with hdrVal's old behaviour
+			// of returning the first match).
+			if _, exists := m[key]; !exists {
+				m[key] = strings.TrimSpace(line[i+1:])
 			}
 		}
 	}
-	return ""
+	return m
 }
 
-func inferFilename(httpHdr, fallback string) string {
+// inferFilenameFromMap is the map-based replacement for inferFilename.
+// It reads content-disposition from the pre-parsed header map and falls
+// back to request-URI extraction using the raw header string (needed to
+// parse the request line which is not a proper header).
+func inferFilenameFromMap(hm map[string]string, rawHdr, fallback string) string {
 	// 1. Content-Disposition header (standard multipart uploads)
-	cd := hdrVal(httpHdr, "content-disposition")
-	if cd != "" {
+	if cd := hm["content-disposition"]; cd != "" {
 		if _, params, err := mime.ParseMediaType(cd); err == nil {
 			if fn := params["filename"]; fn != "" {
 				return fn
@@ -540,8 +585,8 @@ func inferFilename(httpHdr, fallback string) string {
 
 	// 2. Extract request URI from the request line (e.g. "POST /path?q=x HTTP/1.1")
 	var reqURI string
-	if idx := strings.Index(httpHdr, " "); idx > 0 {
-		rest := httpHdr[idx+1:]
+	if idx := strings.Index(rawHdr, " "); idx > 0 {
+		rest := rawHdr[idx+1:]
 		if sp := strings.Index(rest, " "); sp > 0 {
 			reqURI = rest[:sp]
 		}
@@ -549,7 +594,6 @@ func inferFilename(httpHdr, fallback string) string {
 
 	if reqURI != "" {
 		// 2a. SharePoint/OneDrive REST API: filename in @a2 query param
-		//     e.g. /_api/web/.../Files/AddUsingPath(DecodedUrl=@a2,...)&@a2='report.docx'
 		if fn := extractSPFilename(reqURI); fn != "" {
 			return fn
 		}

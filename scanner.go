@@ -1,8 +1,9 @@
 // scanner.go — Scanner interface and pipeline execution.
 //
 // Each scanning engine (ClamAV, DLP, future engines) implements the
-// Scanner interface. The pipeline runs every registered scanner against
-// each piece of content, short-circuiting on the first threat detected.
+// Scanner interface. The pipeline fans out every registered scanner
+// against each piece of content in parallel. The first threat detected
+// (by pipeline registration order) wins.
 //
 // Adding a new scanner:
 //   1. Create a new file (e.g. watermark.go)
@@ -14,6 +15,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"sync"
 )
 
 // Scanner is the interface every scanning engine must implement.
@@ -42,7 +44,8 @@ type Scanner interface {
 }
 
 // pipeline holds the ordered list of scanners.
-// Scanners run in registration order; the first threat wins.
+// Scanners run in parallel; the lowest-index threat wins (preserves
+// registration-order priority).
 type pipeline struct {
 	scanners []Scanner
 }
@@ -76,11 +79,28 @@ func (p *pipeline) closeAll() {
 	}
 }
 
-// scan runs all registered scanners against a single blob.
-// Short-circuits on the first threat detected. The returned threat
-// string is prefixed with the scanner name for the block page / log.
+// scanResult holds the outcome of a single scanner goroutine.
+type scanResult struct {
+	name   string
+	threat string
+	err    error
+	idx    int // registration order — lowest wins
+}
+
+// scan runs all registered scanners against a single blob in parallel.
+// The data slice is read-only during scanning, so sharing it across
+// goroutines is safe. The returned threat string is prefixed with the
+// scanner name for the block page / log.
+//
+// When multiple scanners detect a threat, the one registered first
+// (lowest index) wins — preserving the same priority semantics as the
+// old sequential loop.
 func (p *pipeline) scan(data []byte, filename, clientIP string) (string, error) {
-	for _, s := range p.scanners {
+	n := len(p.scanners)
+
+	// Fast path — single scanner, no goroutine overhead.
+	if n == 1 {
+		s := p.scanners[0]
 		threat, err := s.ScanBytes(data, filename, clientIP)
 		if err != nil {
 			return "", fmt.Errorf("%s: %w", s.Name(), err)
@@ -88,6 +108,41 @@ func (p *pipeline) scan(data []byte, filename, clientIP string) (string, error) 
 		if threat != "" {
 			return fmt.Sprintf("[%s] %s", s.Name(), threat), nil
 		}
+		return "", nil
+	}
+
+	// Fan out all scanners in parallel.
+	results := make([]scanResult, n)
+	var wg sync.WaitGroup
+	wg.Add(n)
+
+	for i, s := range p.scanners {
+		go func(i int, s Scanner) {
+			defer wg.Done()
+			threat, err := s.ScanBytes(data, filename, clientIP)
+			results[i] = scanResult{
+				name:   s.Name(),
+				threat: threat,
+				err:    err,
+				idx:    i,
+			}
+		}(i, s)
+	}
+	wg.Wait()
+
+	// Collect results in registration order — first threat wins.
+	var firstErr error
+	for _, r := range results {
+		if r.err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("%s: %w", r.name, r.err)
+		}
+		if r.threat != "" {
+			return fmt.Sprintf("[%s] %s", r.name, r.threat), nil
+		}
+	}
+
+	if firstErr != nil {
+		return "", firstErr
 	}
 	return "", nil
 }
