@@ -177,13 +177,20 @@ func (s *icapServer) doReqmod(br *bufio.Reader, bw *bufio.Writer, ih map[string]
 
 	// ── Non-multipart: buffer entire body, scan once ──
 	data, err := io.ReadAll(body)
-	if err != nil || len(data) == 0 {
+	if err != nil {
+		s.dbg("non-multipart body read error from %s: %v", cip, err)
+		s.send204(bw)
+		return
+	}
+	if len(data) == 0 {
+		s.dbg("non-multipart body empty from %s (ct=%s) → 204", cip, ct)
 		s.send204(bw)
 		return
 	}
 
 	fname := inferFilename(httpHdr, "upload")
-	s.dbg("non-multipart body: %d bytes, filename=%s", len(data), fname)
+	s.dbg("non-multipart body: %d bytes, filename=%s, ct=%s, magic=%x",
+		len(data), fname, ct, head(data, 4))
 
 	threat, err := s.pipe.scan(data, fname, cip)
 	if err != nil {
@@ -464,7 +471,7 @@ func hdrVal(hdrs, name string) string {
 }
 
 func inferFilename(httpHdr, fallback string) string {
-	// 1. Content-Disposition header (standard multipart / attachment).
+	// 1. Content-Disposition header (standard multipart uploads)
 	cd := hdrVal(httpHdr, "content-disposition")
 	if cd != "" {
 		if _, params, err := mime.ParseMediaType(cd); err == nil {
@@ -474,44 +481,31 @@ func inferFilename(httpHdr, fallback string) string {
 		}
 	}
 
-	// Extract the raw request URI from the first line of the HTTP header.
-	var rawURI string
+	// 2. Extract request URI from the request line (e.g. "POST /path?q=x HTTP/1.1")
+	var reqURI string
 	if idx := strings.Index(httpHdr, " "); idx > 0 {
 		rest := httpHdr[idx+1:]
 		if sp := strings.Index(rest, " "); sp > 0 {
-			rawURI = rest[:sp]
+			reqURI = rest[:sp]
 		}
 	}
 
-	if rawURI != "" {
-		// 2. SharePoint REST API: filename lives in the @a2 query
-		//    parameter (DecodedUrl inside AddUsingPath).
-		//    Pattern: ...AddUsingPath(DecodedUrl=@a2,...)&@a2='filename.txt'
-		if fn := queryParam(rawURI, "@a2"); fn != "" {
-			// SharePoint wraps in single quotes: @a2='report.docx'
-			fn = strings.Trim(fn, "'\"")
-			if fn != "" {
-				return fn
-			}
+	if reqURI != "" {
+		// 2a. SharePoint/OneDrive REST API: filename in @a2 query param
+		//     e.g. /_api/web/.../Files/AddUsingPath(DecodedUrl=@a2,...)&@a2='report.docx'
+		if fn := extractSPFilename(reqURI); fn != "" {
+			return fn
 		}
 
-		// 3. Generic query-string filename parameters used by various
-		//    cloud storage providers and upload APIs.
-		for _, key := range []string{"filename", "file", "name"} {
-			if fn := queryParam(rawURI, key); fn != "" {
-				return fn
-			}
+		// 2b. Generic URL path: last segment
+		pathPart := reqURI
+		if qi := strings.IndexByte(pathPart, '?'); qi >= 0 {
+			pathPart = pathPart[:qi]
 		}
-
-		// 4. Last path segment (original heuristic), but skip if it
-		//    looks like an API function call (contains '(' or '=').
-		if last := strings.LastIndex(rawURI, "/"); last >= 0 && last < len(rawURI)-1 {
-			seg := rawURI[last+1:]
-			// Strip query string from segment.
-			if q := strings.IndexByte(seg, '?'); q > 0 {
-				seg = seg[:q]
-			}
-			if !strings.ContainsAny(seg, "(=") && seg != "" {
+		if last := strings.LastIndex(pathPart, "/"); last >= 0 && last < len(pathPart)-1 {
+			seg := pathPart[last+1:]
+			// Skip API method names that aren't real filenames
+			if !strings.Contains(seg, "(") {
 				return seg
 			}
 		}
@@ -520,35 +514,37 @@ func inferFilename(httpHdr, fallback string) string {
 	return fallback
 }
 
-// queryParam extracts a single URL query-parameter value by key.
-// Handles both ?key=value and &key=value forms, and URL-decodes
-// the result. Returns "" if not found.
-func queryParam(rawURI, key string) string {
-	q := strings.IndexByte(rawURI, '?')
-	if q < 0 {
+// extractSPFilename parses the filename from SharePoint REST upload URLs.
+// OneDrive web uploads use AddUsingPath with @a2 holding the filename:
+//
+//	...AddUsingPath(DecodedUrl=@a2,...)&@a2='report.docx'
+//
+// The @a2 value may be URL-encoded and/or wrapped in single quotes.
+func extractSPFilename(reqURI string) string {
+	qi := strings.IndexByte(reqURI, '?')
+	if qi < 0 {
 		return ""
 	}
-	query := rawURI[q+1:]
-	for query != "" {
-		var kv string
-		if i := strings.IndexByte(query, '&'); i >= 0 {
-			kv, query = query[:i], query[i+1:]
-		} else {
-			kv, query = query, ""
-		}
-		eq := strings.IndexByte(kv, '=')
-		if eq < 0 {
+	query := reqURI[qi+1:]
+
+	// Look for @a2= parameter (SharePoint parameter references)
+	for _, seg := range strings.Split(query, "&") {
+		seg = strings.TrimSpace(seg)
+		if !strings.HasPrefix(seg, "@a2=") && !strings.HasPrefix(seg, "%40a2=") {
 			continue
 		}
-		k := kv[:eq]
-		if k != key {
-			continue
+		val := seg[strings.IndexByte(seg, '=')+1:]
+		if decoded, err := url.QueryUnescape(val); err == nil {
+			val = decoded
 		}
-		v := kv[eq+1:]
-		if decoded, err := url.QueryUnescape(v); err == nil {
-			return decoded
+		val = strings.Trim(val, "' \"")
+		if val != "" {
+			// May be a full path; take just the filename
+			if i := strings.LastIndex(val, "/"); i >= 0 {
+				val = val[i+1:]
+			}
+			return val
 		}
-		return v
 	}
 	return ""
 }
