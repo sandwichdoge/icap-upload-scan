@@ -39,8 +39,18 @@ type DLPScanner struct {
 	RulesDir string // directory containing .yar files
 	Debug    bool   // verbose per-scan logging
 
-	rules *yara.Rules
-	mu    sync.RWMutex
+	rules      *yara.Rules
+	mu         sync.RWMutex
+	generation uint64    // incremented on rule reload; scanners with stale gen are discarded
+	scanPool   sync.Pool // pool of *pooledScanner
+}
+
+// pooledScanner pairs a YARA scanner with the rule generation it was
+// created from. On checkout, if the generation doesn't match the
+// current one, the scanner is destroyed and a fresh one is created.
+type pooledScanner struct {
+	scanner *yara.Scanner
+	gen     uint64
 }
 
 func (d *DLPScanner) Name() string { return "dlp" }
@@ -51,6 +61,7 @@ func (d *DLPScanner) Init() error {
 		return err
 	}
 	d.rules = rules
+	d.generation = 1
 	log.Printf("dlp: loaded %d rule file(s) from %s", count, d.RulesDir)
 	return nil
 }
@@ -77,6 +88,7 @@ func (d *DLPScanner) ReloadRules() {
 	d.mu.Lock()
 	old := d.rules
 	d.rules = rules
+	d.generation++ // invalidates all pooled scanners from previous rules
 	d.mu.Unlock()
 	if old != nil {
 		old.Destroy()
@@ -135,26 +147,44 @@ func (d *DLPScanner) scanData(data []byte, label string) string {
 
 	d.mu.RLock()
 	rules := d.rules
+	gen := d.generation
 	d.mu.RUnlock()
 
 	if rules == nil {
 		return ""
 	}
 
-	scanner, err := yara.NewScanner(rules)
-	if err != nil {
-		log.Printf("dlp: scanner init error: %v", err)
-		return ""
+	// Try to get a pooled scanner. If the generation doesn't match
+	// (rules were reloaded), destroy it and create a fresh one.
+	var sc *yara.Scanner
+	if ps, ok := d.scanPool.Get().(*pooledScanner); ok && ps != nil {
+		if ps.gen == gen {
+			sc = ps.scanner
+		} else {
+			// Stale scanner from previous rules — discard.
+			ps.scanner.Destroy()
+		}
 	}
-	defer scanner.Destroy()
 
-	scanner.SetTimeout(30 * time.Second)
+	if sc == nil {
+		var err error
+		sc, err = yara.NewScanner(rules)
+		if err != nil {
+			log.Printf("dlp: scanner init error: %v", err)
+			return ""
+		}
+		sc.SetTimeout(30 * time.Second)
+	}
 
 	var matches yara.MatchRules
-	if err := scanner.SetCallback(&matches).ScanMem(data); err != nil {
+	if err := sc.SetCallback(&matches).ScanMem(data); err != nil {
 		log.Printf("dlp: scan error [%s]: %v", label, err)
+		sc.Destroy() // don't return a potentially broken scanner
 		return ""
 	}
+
+	// Return scanner to pool for reuse.
+	d.scanPool.Put(&pooledScanner{scanner: sc, gen: gen})
 
 	if len(matches) > 0 {
 		m := matches[0]
@@ -177,13 +207,9 @@ func (d *DLPScanner) scanFile(data []byte, filename, clientIP string) (string, e
 		return threat, nil
 	}
 
-	// 2. Encoding detection
-	if threat := d.scanDecoded(data, filename, clientIP); threat != "" {
-		return threat, nil
-	}
-
-	// 3. OOXML extraction — short-circuit: scan each entry as it's
-	//    decompressed rather than extracting the entire archive first.
+	// 2. OOXML extraction — cheap magic-byte check, then short-circuit
+	//    scan of each ZIP entry. Runs before encoding detection to avoid
+	//    expensive regex passes over binary ZIP data.
 	if isOOXML(data) {
 		d.dbg("scanFile: %s is OOXML/ZIP, extracting", filename)
 		threat, err := d.scanOOXML(data, filename, clientIP)
@@ -194,6 +220,11 @@ func (d *DLPScanner) scanFile(data []byte, filename, clientIP string) (string, e
 		if threat != "" {
 			return threat, nil
 		}
+	}
+
+	// 3. Encoding detection — base64, hex, URL-encoded payloads.
+	if threat := d.scanDecoded(data, filename, clientIP); threat != "" {
+		return threat, nil
 	}
 
 	return "", nil
