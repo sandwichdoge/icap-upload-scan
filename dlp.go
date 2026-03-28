@@ -1,11 +1,14 @@
 // dlp.go — DLP scanning engine with YARA rules.
 //
 // Implements the Scanner interface. Scans content against compiled YARA
-// rules with three layers of analysis:
+// rules with four layers of analysis:
 //
 //   1. Raw bytes — catches binary YARA patterns in any file type
-//   2. OOXML extraction — unzips .docx/.xlsx/.pptx, strips XML tags,
-//      and scans plaintext + embedded media individually
+//   2. Recursive ZIP/OOXML extraction — unzips any PK archive up to
+//      maxZIPDepth levels deep, scanning every entry. OOXML entries
+//      (.xml) get tag-stripping; media paths get raw scans; nested
+//      ZIPs and OOXML files (e.g. .docx inside .zip inside .zip)
+//      are recursed into automatically.
 //   3. Encoding detection — decodes base64, hex, and URL-encoded
 //      payloads and re-scans the decoded content
 //
@@ -33,6 +36,16 @@ import (
 
 	yara "github.com/hillu/go-yara/v4"
 )
+
+// maxZIPDepth caps recursive archive extraction to prevent zip bombs
+// and pathological nesting. Covers .zip → .zip → .docx → xml (depth 3)
+// with headroom for exotic cases.
+const maxZIPDepth = 5
+
+// maxTotalDecompressed is a cumulative byte budget across all recursion
+// levels for a single top-level scan. Prevents decompression bombs that
+// stay under the per-entry limit but explode in aggregate.
+const maxTotalDecompressed = 200 << 20 // 200 MB
 
 // DLPScanner applies YARA DLP rules to content.
 type DLPScanner struct {
@@ -97,7 +110,7 @@ func (d *DLPScanner) ReloadRules() {
 }
 
 // ScanBytes is the Scanner interface entry point. Orchestrates raw scan,
-// OOXML extraction, and encoding detection.
+// recursive ZIP extraction, and encoding detection.
 func (d *DLPScanner) ScanBytes(data []byte, filename, clientIP string) (string, error) {
 	return d.scanFile(data, filename, clientIP)
 }
@@ -207,17 +220,16 @@ func (d *DLPScanner) scanFile(data []byte, filename, clientIP string) (string, e
 		return threat, nil
 	}
 
-	// 2. OOXML extraction — cheap magic-byte check, then short-circuit
-	//    scan of each ZIP entry. Runs before encoding detection to avoid
-	//    expensive regex passes over binary ZIP data.
-	if isOOXML(data) {
-		d.dbg("scanFile: %s is OOXML/ZIP, extracting", filename)
-		threat, err := d.scanOOXML(data, filename, clientIP)
+	// 2. Recursive ZIP/OOXML extraction — handles plain .zip, .docx,
+	//    .xlsx, .pptx, nested archives, and OOXML-inside-zip.
+	if isZIP(data) {
+		d.dbg("scanFile: %s is ZIP/OOXML, extracting (depth 0)", filename)
+		totalRead := int64(0)
+		threat, err := d.scanZIPRecursive(data, filename, clientIP, 0, &totalRead)
 		if err != nil {
-			log.Printf("dlp: ooxml scan warning [%s]: %v", filename, err)
-			return "", nil
-		}
-		if threat != "" {
+			log.Printf("dlp: zip scan warning [%s]: %v", filename, err)
+			// Non-fatal — continue to encoding detection.
+		} else if threat != "" {
 			return threat, nil
 		}
 	}
@@ -230,59 +242,87 @@ func (d *DLPScanner) scanFile(data []byte, filename, clientIP string) (string, e
 	return "", nil
 }
 
-// ── OOXML scanning (short-circuit) ──────────────────────────────
+// ── Recursive ZIP scanning ──────────────────────────────────────
 //
-// scanOOXML opens the ZIP, iterates entries, and scans each XML/media
-// entry as it is decompressed. Returns immediately on the first threat
-// without decompressing remaining entries.
+// scanZIPRecursive opens a ZIP archive, iterates every entry, and
+// dispatches each one based on content type:
+//
+//   - .xml entries     → strip tags, decode entities, YARA scan text
+//   - OOXML media dirs → YARA scan raw bytes
+//   - nested ZIP/OOXML → recurse (depth + 1)
+//   - everything else  → YARA scan raw bytes
+//
+// Short-circuits on the first threat. Depth and cumulative byte
+// budgets prevent zip bombs.
 
-func (d *DLPScanner) scanOOXML(data []byte, filename, clientIP string) (string, error) {
+func (d *DLPScanner) scanZIPRecursive(data []byte, filename, clientIP string, depth int, totalRead *int64) (string, error) {
+	if depth >= maxZIPDepth {
+		d.dbg("scanZIP: max depth %d reached for %s, skipping", maxZIPDepth, filename)
+		return "", nil
+	}
+
 	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return "", fmt.Errorf("zip open: %w", err)
 	}
 
 	for _, f := range zr.File {
+		// Per-entry size guard.
 		if f.UncompressedSize64 > 50<<20 {
-			continue // zip bomb guard
+			d.dbg("scanZIP: skipping oversized entry %s (%d bytes)", f.Name, f.UncompressedSize64)
+			continue
 		}
+
+		// Cumulative decompression budget.
+		if *totalRead > maxTotalDecompressed {
+			d.dbg("scanZIP: cumulative decompression budget exceeded at %s", f.Name)
+			return "", nil
+		}
+
+		// Skip directories.
+		if strings.HasSuffix(f.Name, "/") {
+			continue
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		raw, err := io.ReadAll(io.LimitReader(rc, 50<<20))
+		rc.Close()
+		if err != nil {
+			continue
+		}
+		*totalRead += int64(len(raw))
 
 		lower := strings.ToLower(f.Name)
+		label := fmt.Sprintf("d%d:%s/%s", depth, filename, f.Name)
 
-		// ── XML entries: strip tags, decode entities, scan ──
-		if strings.HasSuffix(lower, ".xml") {
-			rc, err := f.Open()
-			if err != nil {
-				continue
-			}
-			raw, err := io.ReadAll(io.LimitReader(rc, 10<<20))
-			rc.Close()
-			if err != nil {
-				continue
-			}
+		// ── XML entries (OOXML document content): strip tags, scan text ──
+		if strings.HasSuffix(lower, ".xml") || strings.HasSuffix(lower, ".rels") {
 			stripped := stripXMLTags(raw)
 			decoded := decodeXMLEntities(stripped)
-
-			if threat := d.scanData(decoded, "xml:"+f.Name); threat != "" {
-				log.Printf("dlp: FOUND %s in XML entry %s of %s from %s", threat, f.Name, filename, clientIP)
+			if threat := d.scanData(decoded, "xml:"+label); threat != "" {
+				log.Printf("dlp: FOUND %s in XML entry %s from %s", threat, label, clientIP)
 				return threat, nil
 			}
+			continue
 		}
 
-		// ── Media/embedded entries: scan raw bytes ──
-		if isMediaPath(f.Name) {
-			rc, err := f.Open()
-			if err != nil {
-				continue
-			}
-			raw, err := io.ReadAll(io.LimitReader(rc, 20<<20))
-			rc.Close()
-			if err != nil {
-				continue
-			}
+		// ── Scan raw bytes of every non-XML entry ──
+		if threat := d.scanData(raw, label); threat != "" {
+			log.Printf("dlp: FOUND %s in %s from %s", threat, label, clientIP)
+			return threat, nil
+		}
 
-			if threat := d.scanData(raw, f.Name); threat != "" {
-				log.Printf("dlp: FOUND %s in %s embedded in %s from %s", threat, f.Name, filename, clientIP)
+		// ── Recurse into nested ZIP/OOXML archives ──
+		if isZIP(raw) {
+			d.dbg("scanZIP: recursing into nested archive %s (depth %d→%d)", f.Name, depth, depth+1)
+			threat, err := d.scanZIPRecursive(raw, label, clientIP, depth+1, totalRead)
+			if err != nil {
+				d.dbg("scanZIP: nested scan warning [%s]: %v", label, err)
+				// Non-fatal — continue scanning remaining entries.
+			} else if threat != "" {
 				return threat, nil
 			}
 		}
@@ -291,9 +331,17 @@ func (d *DLPScanner) scanOOXML(data []byte, filename, clientIP string) (string, 
 	return "", nil
 }
 
-func isOOXML(data []byte) bool {
+// isZIP checks the PK\x03\x04 magic bytes. Matches both plain ZIP
+// archives and OOXML formats (.docx, .xlsx, .pptx).
+func isZIP(data []byte) bool {
 	return len(data) >= 4 &&
 		data[0] == 'P' && data[1] == 'K' && data[2] == 0x03 && data[3] == 0x04
+}
+
+// isOOXML is kept as an alias for backward compatibility with
+// scanDecoded's base64 path.
+func isOOXML(data []byte) bool {
+	return isZIP(data)
 }
 
 var ooxmlMediaDirs = []string{
@@ -432,8 +480,10 @@ func (d *DLPScanner) scanDecoded(data []byte, label, clientIP string) string {
 			log.Printf("dlp: FOUND %s in base64-decoded content of %s from %s", threat, label, clientIP)
 			return threat
 		}
-		if isOOXML(decoded) {
-			threat, err := d.scanOOXML(decoded, "b64:"+label, clientIP)
+		// If the decoded base64 is a ZIP/OOXML, recurse into it.
+		if isZIP(decoded) {
+			totalRead := int64(0)
+			threat, err := d.scanZIPRecursive(decoded, "b64:"+label, clientIP, 0, &totalRead)
 			if err == nil && threat != "" {
 				return threat
 			}
