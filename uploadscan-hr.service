@@ -4,6 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
+ExecStartPre=/bin/mkdir -p /var/log/uploadscan
+ExecStartPre=/bin/chown -R c-icap:c-icap /var/log/uploadscan
 ExecStart=/opt/uploadscan/uploadscan \
     -port 1391 \
     -rules-dir /var/lib/uploadscan/rules-hr \
