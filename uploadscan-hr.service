@@ -4,13 +4,12 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStartPre=/bin/mkdir -p /var/log/uploadscan
-ExecStartPre=/bin/chown -R c-icap:c-icap /var/log/uploadscan
 ExecStart=/opt/uploadscan/uploadscan \
     -port 1391 \
     -rules-dir /var/lib/uploadscan/rules-hr \
     -template /usr/share/c_icap/templates/virus_scan/en/VIRUS_FOUND \
     -log /var/log/uploadscan/uploadscan-hr.log \
+    -clamd-socket /run/clamav/clamd-hr.ctl \
     -max-conns 32 \
     -max-body-mb 30 \
     -max-part-mb 15
