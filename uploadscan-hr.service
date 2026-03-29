@@ -17,3 +17,6 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 User=c-icap
+
+[Install]
+WantedBy=multi-user.target
